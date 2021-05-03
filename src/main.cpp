@@ -171,8 +171,6 @@ void setup()
     ;
 
   Serial.begin(115200);
-  while (!Serial)
-    ;
 
   // Builtin LED will be used to indicate LoRa Activity
   pinMode(BOARD_LED, OUTPUT);
