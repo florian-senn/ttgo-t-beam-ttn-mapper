@@ -1,9 +1,32 @@
 #include <Arduino.h>
-#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <lmic.h>
 #include <hal/hal.h>
 #include <TinyGPS++.h>
+#include <Wire.h>
+#include <axp20x.h>
 #include <config.h>
+
+BLECharacteristic *characteristicTX;
+#define BatteryService BLEUUID((uint16_t)0x180F)
+BLECharacteristic BatteryLevelCharacteristic(BLEUUID((uint16_t)0x2A19), BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+BLEDescriptor BatteryLevelDescriptor(BLEUUID((uint16_t)0x2901));
+bool _BLEClientConnected = false;
+class MyServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer *pServer)
+  {
+    _BLEClientConnected = true;
+  };
+
+  void onDisconnect(BLEServer *pServer)
+  {
+    _BLEClientConnected = false;
+  }
+};
 
 // Delay between Lora Send
 uint8_t sendInterval[] = {20, 30, 40, 10};
@@ -12,8 +35,9 @@ uint8_t sendIntervalKey = 3;
 HardwareSerial GPSSerial(1);
 TinyGPSPlus GPS;
 
+AXP20X_Class axp;
+
 String LoraStatus;
-boolean hasFix = false;
 
 static osjob_t sendjob;
 
@@ -43,6 +67,12 @@ bool gpsHasFix()
           GPS.altitude.isValid() &&
           GPS.altitude.age() < 2000);
 }
+
+unsigned long now = millis();
+unsigned long reportSpan = 3000UL;
+unsigned long lastReport = now + reportSpan;
+unsigned long bleSpan = 3000UL;
+unsigned long lastBle = now + bleSpan;
 
 // Lora Event Handling
 void onEvent(ev_t ev)
@@ -163,14 +193,26 @@ void do_send(osjob_t *j)
 
 void setup()
 {
-  WiFi.mode(WIFI_OFF);
-  btStop();
-
   GPSSerial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   while (!GPSSerial)
     ;
 
   Serial.begin(115200);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  int ret = axp.begin(Wire, AXP192_SLAVE_ADDRESS);
+
+  if (ret == AXP_FAIL)
+  {
+    Serial.println("AXP Power begin failed");
+    while (1)
+      ;
+  }
+
+  axp.adc1Enable(AXP202_VBUS_VOL_ADC1, 1);
+  axp.adc1Enable(AXP202_VBUS_CUR_ADC1, 1);
+  axp.EnableCoulombcounter();
 
   // Builtin LED will be used to indicate LoRa Activity
   pinMode(BOARD_LED, OUTPUT);
@@ -202,19 +244,138 @@ void setup()
 
   do_send(&sendjob);
   digitalWrite(BUILTIN_LED, LOW);
+
+  BLEDevice::init("BLE Battery");
+  // Create the BLE Server
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pBattery = pServer->createService(BatteryService);
+
+  pBattery->addCharacteristic(&BatteryLevelCharacteristic);
+  BatteryLevelDescriptor.setValue("Percentage 0 - 100");
+  BatteryLevelCharacteristic.addDescriptor(&BatteryLevelDescriptor);
+  BatteryLevelCharacteristic.addDescriptor(new BLE2902());
+
+  pServer->getAdvertising()->addServiceUUID(BatteryService);
+
+  pBattery->start();
+  // Start advertising
+  pServer->getAdvertising()->start();
 }
 
 void loop()
 {
+  now = millis();
   while (GPSSerial.available())
   {
     char data = GPSSerial.read();
     GPS.encode(data);
-    Serial.write(data);
+    //Serial.write(data);
   }
   while (Serial.available())
   {
     GPSSerial.write(Serial.read());
+  }
+
+  if (now - reportSpan > lastReport)
+  {
+    lastReport = now;
+    Serial.println("=========================");
+    Serial.print("VBUS STATUS: ");
+    // You can use isVBUSPlug to check whether the USB connection is normal
+    if (axp.isVBUSPlug())
+    {
+
+      Serial.println("CONNECT");
+
+      // Get USB voltage
+      Serial.print("VBUS Voltage: ");
+      Serial.print(axp.getVbusVoltage());
+      Serial.println(" mV");
+
+      // Get USB current
+      Serial.print("VBUS Current: ");
+      Serial.print(axp.getVbusCurrent());
+      Serial.println(" mA");
+    }
+    else
+    {
+      Serial.println("DISCONNECT");
+    }
+
+    Serial.println("=========================");
+
+    Serial.print("BATTERY STATUS: ");
+
+    // You can use isBatteryConnect() to check whether the battery is connected properly
+    if (axp.isBatteryConnect())
+    {
+      Serial.println("CONNECT");
+
+      // Get battery voltage
+      Serial.print("BAT Voltage: ");
+      Serial.print(axp.getBattVoltage());
+      Serial.println(" mV");
+
+      // To display the charging status, you must first discharge the battery,
+      // and it is impossible to read the full charge when it is fully charged
+      if (axp.isChargeing())
+      {
+        Serial.print("Charge: ");
+        Serial.print(axp.getBattChargeCurrent());
+        Serial.println(" mA");
+      }
+      else
+      {
+        // Show current consumption
+        Serial.print("Discharge: ");
+        Serial.print(axp.getBattDischargeCurrent());
+        Serial.println(" mA");
+      }
+    }
+    else
+    {
+      Serial.println("DISCONNECT");
+    }
+    Serial.print("AXP Temperature: ");
+    Serial.print(axp.getTemp());
+    Serial.println(" °C");
+    Serial.print("Coulomb Dis-/Charge: ");
+    Serial.print(axp.getBattDischargeCoulomb());
+    Serial.print("/");
+    Serial.print(axp.getBattChargeCoulomb());
+    Serial.println(" C");
+    Serial.print("Coulomb Data: ");
+    Serial.print(axp.getCoulombData());
+    Serial.println(" C");
+    Serial.print("Power Down: ");
+    Serial.print(axp.getPowerDownVoltage());
+    Serial.println(" mV");
+    Serial.print("Warning 1: ");
+    Serial.print(axp.getVWarningLevel1());
+    Serial.println(" mV");
+    Serial.print("Warning 2: ");
+    Serial.print(axp.getVWarningLevel2());
+    Serial.println(" mV");
+    Serial.println();
+    Serial.println();
+  }
+  if (axp.getTemp() > 70.0)
+  {
+    axp.setChargeControlCur(AXP1XX_CHARGE_CUR_630MA);
+  }
+  else if (axp.getTemp() < 66.0)
+  {
+    axp.setChargeControlCur(AXP1XX_CHARGE_CUR_1000MA);
+  }
+  if (_BLEClientConnected && now - lastBle > bleSpan)
+  {
+    lastBle = now;
+    uint8_t level = map(axp.getBattVoltage(), 2600, 4200, 0, 100);
+    BatteryLevelCharacteristic.setValue(&level, 1);
+    BatteryLevelCharacteristic.notify();
   }
   os_runloop_once();
   yield();
