@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <Preferences.h>
+#include <WiFi.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -10,23 +12,30 @@
 #include <axp20x.h>
 #include <config.h>
 
-BLECharacteristic *characteristicTX;
 #define BatteryService BLEUUID((uint16_t)0x180F)
 BLECharacteristic BatteryLevelCharacteristic(BLEUUID((uint16_t)0x2A19), BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
 BLEDescriptor BatteryLevelDescriptor(BLEUUID((uint16_t)0x2901));
-bool _BLEClientConnected = false;
+BLECharacteristic UartCharacteristic(UART_CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+BLEServer *pServer;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
 class MyServerCallbacks : public BLEServerCallbacks
 {
   void onConnect(BLEServer *pServer)
   {
-    _BLEClientConnected = true;
+    deviceConnected = true;
   };
 
   void onDisconnect(BLEServer *pServer)
   {
-    _BLEClientConnected = false;
+    deviceConnected = false;
   }
 };
+
+uint8_t getBatLevel();
+
+Preferences prefs;
 
 // Delay between Lora Send
 uint8_t sendInterval[] = {20, 30, 40, 10};
@@ -38,12 +47,10 @@ TinyGPSPlus GPS;
 AXP20X_Class axp;
 
 String LoraStatus;
+uint8_t tdata[9];
+uint8_t bdata[7];
 
 static osjob_t sendjob;
-
-uint8_t loraBuffer[9];
-
-TinyGPSLocation lastLocation = TinyGPSLocation();
 
 void os_getArtEui(u1_t *buf) {}
 void os_getDevEui(u1_t *buf) {}
@@ -69,10 +76,9 @@ bool gpsHasFix()
 }
 
 unsigned long now = millis();
-unsigned long reportSpan = 3000UL;
-unsigned long lastReport = now + reportSpan;
-unsigned long bleSpan = 3000UL;
+unsigned long bleSpan = 5000UL;
 unsigned long lastBle = now + bleSpan;
+uint8_t lastBatLevel = 0;
 
 // Lora Event Handling
 void onEvent(ev_t ev)
@@ -119,7 +125,7 @@ void onEvent(ev_t ev)
   case EV_TXCOMPLETE:
     Serial.println("LoRa: onEvent: EV_TXCOMPLETE");
     LoraStatus = "TXCOMPL";
-    digitalWrite(BUILTIN_LED, LOW);
+    digitalWrite(BOARD_LED, LED_OFF);
     if (LMIC.txrxFlags & TXRX_ACK)
     {
       LoraStatus = "Recvd Ack";
@@ -154,7 +160,6 @@ void onEvent(ev_t ev)
 
 void do_send(osjob_t *j)
 {
-
   // Check if there is not a current TX/RX job running
   if (LMIC.opmode & OP_TXRXPEND)
   {
@@ -162,27 +167,43 @@ void do_send(osjob_t *j)
   }
   else
   {
-    if (gpsHasFix() && GPS.distanceBetween(lastLocation.lat(), lastLocation.lng(), GPS.location.lat(), GPS.location.lng()) > 50.0)
+    double lat = GPS.location.lat();
+    double lng = GPS.location.lng();
+    if (gpsHasFix() && GPS.distanceBetween(prefs.getDouble("lat", 0.0), prefs.getDouble("lng", 0.0), lat, lng) > MINIMUM_DISTANCE)
     {
-      uint32_t LatitudeBinary = ((GPS.location.lat() + 90) / 180.0) * 16777215;
-      uint32_t LongitudeBinary = ((GPS.location.lng() + 180) / 360.0) * 16777215;
+      uint32_t LatitudeBinary = ((lat + 90) / 180.0) * 16777215;
+      uint32_t LongitudeBinary = ((lng + 180) / 360.0) * 16777215;
       uint16_t altitudeGps = GPS.altitude.meters();
       uint8_t hdopGps = GPS.hdop.value() / 10;
-
-      loraBuffer[0] = (LatitudeBinary >> 16) & 0xFF;
-      loraBuffer[1] = (LatitudeBinary >> 8) & 0xFF;
-      loraBuffer[2] = LatitudeBinary & 0xFF;
-      loraBuffer[3] = (LongitudeBinary >> 16) & 0xFF;
-      loraBuffer[4] = (LongitudeBinary >> 8) & 0xFF;
-      loraBuffer[5] = LongitudeBinary & 0xFF;
-      loraBuffer[6] = (altitudeGps >> 8) & 0xFF;
-      loraBuffer[7] = altitudeGps & 0xFF;
-      loraBuffer[8] = hdopGps & 0xFF;
-
-      LMIC_setTxData2(1, loraBuffer, sizeof(loraBuffer), 0);
-      digitalWrite(BUILTIN_LED, HIGH);
+      uint8_t batteryLevel = getBatLevel();
+      if (TTN_MAPPER)
+      {
+        tdata[0] = (LatitudeBinary >> 16) & 0xFF;
+        tdata[1] = (LatitudeBinary >> 8) & 0xFF;
+        tdata[2] = LatitudeBinary & 0xFF;
+        tdata[3] = (LongitudeBinary >> 16) & 0xFF;
+        tdata[4] = (LongitudeBinary >> 8) & 0xFF;
+        tdata[5] = LongitudeBinary & 0xFF;
+        tdata[6] = (altitudeGps >> 8) & 0xFF;
+        tdata[7] = altitudeGps & 0xFF;
+        tdata[8] = hdopGps & 0xFF;
+        LMIC_setTxData2(1, tdata, sizeof(tdata), 0);
+      }
+      else
+      {
+        bdata[0] = (LatitudeBinary >> 16) & 0xFF;
+        bdata[1] = (LatitudeBinary >> 8) & 0xFF;
+        bdata[2] = LatitudeBinary & 0xFF;
+        bdata[3] = (LongitudeBinary >> 16) & 0xFF;
+        bdata[4] = (LongitudeBinary >> 8) & 0xFF;
+        bdata[5] = LongitudeBinary & 0xFF;
+        bdata[6] = batteryLevel & 0xFF;
+        LMIC_setTxData2(1, bdata, sizeof(bdata), 0);
+      }
+      digitalWrite(BOARD_LED, LED_ON);
       LoraStatus = "QUEUED";
-      lastLocation = GPS.location;
+      prefs.putDouble("lat", lat);
+      prefs.putDouble("lng", lng);
     }
     else
     {
@@ -193,31 +214,32 @@ void do_send(osjob_t *j)
 
 void setup()
 {
-  GPSSerial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  WiFi.mode(WIFI_OFF);
+  WiFi.setSleep(true);
+  prefs.begin("lat", false);
+  prefs.begin("lng", false);
+
+  GPSSerial.begin(SERIAL_SPEED, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   while (!GPSSerial)
     ;
 
-  Serial.begin(115200);
+  Serial.begin(SERIAL_SPEED);
 
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  int ret = axp.begin(Wire, AXP192_SLAVE_ADDRESS);
-
-  if (ret == AXP_FAIL)
+  while (axp.begin(Wire, AXP192_SLAVE_ADDRESS) == AXP_FAIL)
   {
     Serial.println("AXP Power begin failed");
-    while (1)
-      ;
   }
 
   axp.adc1Enable(AXP202_VBUS_VOL_ADC1, 1);
   axp.adc1Enable(AXP202_VBUS_CUR_ADC1, 1);
   axp.EnableCoulombcounter();
-
-  // Builtin LED will be used to indicate LoRa Activity
+  axp.setChargingTargetVoltage(AXP202_TARGET_VOL_4_1V);
+  axp.setPowerDownVoltage(POWER_DOWN);
   pinMode(BOARD_LED, OUTPUT);
 
-  // LoRa Init
+  //  Init
   os_init();
   LMIC_reset();
   LMIC_setSession(0x1, DEVADDR, NWKSKEY, APPSKEY);
@@ -238,145 +260,105 @@ void setup()
   // Disable Data Rate Adaptation, for Mapping we want static SF7
   LMIC_setAdrMode(0);
   // Set data rate and transmit power for uplink (note: txpow seems to be ignored by the library)
-  LMIC_setDrTxpow(DR_SF7, 14);
+  LMIC_setDrTxpow(SF, 14);
   // Don't do Link Checks
   LMIC_setLinkCheckMode(0);
 
   do_send(&sendjob);
-  digitalWrite(BUILTIN_LED, LOW);
+  digitalWrite(BOARD_LED, LED_OFF);
 
-  BLEDevice::init("BLE Battery");
+  BLEDevice::init(DEVICE_NAME);
   // Create the BLE Server
-  BLEServer *pServer = BLEDevice::createServer();
+  pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   // Create the BLE Service
   BLEService *pBattery = pServer->createService(BatteryService);
-
   pBattery->addCharacteristic(&BatteryLevelCharacteristic);
   BatteryLevelDescriptor.setValue("Percentage 0 - 100");
   BatteryLevelCharacteristic.addDescriptor(&BatteryLevelDescriptor);
   BatteryLevelCharacteristic.addDescriptor(new BLE2902());
 
+  BLEService *pUART = pServer->createService(UART_SERVICE_UUID);
+  UartCharacteristic.addDescriptor(new BLE2902());
+  pUART->addCharacteristic(&UartCharacteristic);
+
   pServer->getAdvertising()->addServiceUUID(BatteryService);
+  pServer->getAdvertising()->addServiceUUID(UART_SERVICE_UUID);
 
   pBattery->start();
+  pUART->start();
   // Start advertising
   pServer->getAdvertising()->start();
 }
 
+uint8_t getBatLevel()
+{
+  float volt = axp.getBattVoltage();
+  float con = constrain(volt, POWER_DOWN, CHARGE_CUTOFF);
+  return map(con, POWER_DOWN, CHARGE_CUTOFF, 0, 100);
+}
+
+void reportBatBLE()
+{
+  uint8_t level = getBatLevel();
+  if (lastBatLevel != level)
+  {
+    lastBatLevel = level;
+    BatteryLevelCharacteristic.setValue(&level, 1);
+    BatteryLevelCharacteristic.notify();
+  }
+}
+
+void reportInfoBLE()
+{
+  float current;
+  if (axp.isChargeing())
+  {
+    current = axp.getBattChargeCurrent();
+  }
+  else
+  {
+    current = axp.getBattDischargeCurrent();
+  }
+  char buf[7];
+  dtostrf(current, 5, 1, buf);
+  UartCharacteristic.setValue(buf);
+  UartCharacteristic.notify();
+}
+
+void BLE()
+{
+  if (deviceConnected && now - lastBle > bleSpan)
+  {
+    reportBatBLE();
+    reportInfoBLE();
+    lastBle = now;
+  }
+  if (!deviceConnected && oldDeviceConnected)
+  {
+    pServer->getAdvertising()->start();
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected)
+  {
+    oldDeviceConnected = deviceConnected;
+  }
+}
+
 void loop()
 {
+  os_runloop_once();
   now = millis();
   while (GPSSerial.available())
   {
     char data = GPSSerial.read();
     GPS.encode(data);
-    //Serial.write(data);
+    Serial.write(data);
   }
   while (Serial.available())
   {
     GPSSerial.write(Serial.read());
   }
-
-  if (now - reportSpan > lastReport)
-  {
-    lastReport = now;
-    Serial.println("=========================");
-    Serial.print("VBUS STATUS: ");
-    // You can use isVBUSPlug to check whether the USB connection is normal
-    if (axp.isVBUSPlug())
-    {
-
-      Serial.println("CONNECT");
-
-      // Get USB voltage
-      Serial.print("VBUS Voltage: ");
-      Serial.print(axp.getVbusVoltage());
-      Serial.println(" mV");
-
-      // Get USB current
-      Serial.print("VBUS Current: ");
-      Serial.print(axp.getVbusCurrent());
-      Serial.println(" mA");
-    }
-    else
-    {
-      Serial.println("DISCONNECT");
-    }
-
-    Serial.println("=========================");
-
-    Serial.print("BATTERY STATUS: ");
-
-    // You can use isBatteryConnect() to check whether the battery is connected properly
-    if (axp.isBatteryConnect())
-    {
-      Serial.println("CONNECT");
-
-      // Get battery voltage
-      Serial.print("BAT Voltage: ");
-      Serial.print(axp.getBattVoltage());
-      Serial.println(" mV");
-
-      // To display the charging status, you must first discharge the battery,
-      // and it is impossible to read the full charge when it is fully charged
-      if (axp.isChargeing())
-      {
-        Serial.print("Charge: ");
-        Serial.print(axp.getBattChargeCurrent());
-        Serial.println(" mA");
-      }
-      else
-      {
-        // Show current consumption
-        Serial.print("Discharge: ");
-        Serial.print(axp.getBattDischargeCurrent());
-        Serial.println(" mA");
-      }
-    }
-    else
-    {
-      Serial.println("DISCONNECT");
-    }
-    Serial.print("AXP Temperature: ");
-    Serial.print(axp.getTemp());
-    Serial.println(" °C");
-    Serial.print("Coulomb Dis-/Charge: ");
-    Serial.print(axp.getBattDischargeCoulomb());
-    Serial.print("/");
-    Serial.print(axp.getBattChargeCoulomb());
-    Serial.println(" C");
-    Serial.print("Coulomb Data: ");
-    Serial.print(axp.getCoulombData());
-    Serial.println(" C");
-    Serial.print("Power Down: ");
-    Serial.print(axp.getPowerDownVoltage());
-    Serial.println(" mV");
-    Serial.print("Warning 1: ");
-    Serial.print(axp.getVWarningLevel1());
-    Serial.println(" mV");
-    Serial.print("Warning 2: ");
-    Serial.print(axp.getVWarningLevel2());
-    Serial.println(" mV");
-    Serial.println();
-    Serial.println();
-  }
-  if (axp.getTemp() > 70.0)
-  {
-    axp.setChargeControlCur(AXP1XX_CHARGE_CUR_630MA);
-  }
-  else if (axp.getTemp() < 66.0)
-  {
-    axp.setChargeControlCur(AXP1XX_CHARGE_CUR_1000MA);
-  }
-  if (_BLEClientConnected && now - lastBle > bleSpan)
-  {
-    lastBle = now;
-    uint8_t level = map(axp.getBattVoltage(), 2600, 4200, 0, 100);
-    BatteryLevelCharacteristic.setValue(&level, 1);
-    BatteryLevelCharacteristic.notify();
-  }
-  os_runloop_once();
-  yield();
+  BLE();
 }
