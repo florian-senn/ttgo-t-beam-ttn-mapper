@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"name": "ttgo-t-beam-ttn-mapper",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"functional": "cpp",
+			"istream": "cpp"
+		}
+	}
+}
