@@ -38,8 +38,8 @@ uint8_t getBatLevel();
 Preferences prefs;
 
 // Delay between Lora Send
-uint8_t sendInterval[] = {20, 30, 40, 10};
-uint8_t sendIntervalKey = 3;
+uint8_t sendInterval[] = {10, 20, 30, 60, 120};
+bool firstSend = true;
 
 HardwareSerial GPSSerial(1);
 TinyGPSPlus GPS;
@@ -48,7 +48,7 @@ AXP20X_Class axp;
 
 String LoraStatus;
 uint8_t tdata[9];
-uint8_t bdata[7];
+uint8_t bdata[6];
 
 static osjob_t sendjob;
 
@@ -130,7 +130,8 @@ void onEvent(ev_t ev)
     {
       LoraStatus = "Recvd Ack";
     }
-    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks((sendInterval[sendIntervalKey])), do_send);
+    prefs.putUInt("frameCountUp", LMIC.seqnoUp);
+    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks((sendInterval[SEND_INTERVAL])), do_send);
     break;
   case EV_LOST_TSYNC:
     Serial.println("LoRa: onEvent: EV_LOST_TSYNC");
@@ -169,13 +170,14 @@ void do_send(osjob_t *j)
   {
     double lat = GPS.location.lat();
     double lng = GPS.location.lng();
-    if (gpsHasFix() && GPS.distanceBetween(prefs.getDouble("lat", 0.0), prefs.getDouble("lng", 0.0), lat, lng) > MINIMUM_DISTANCE)
+    if (gpsHasFix() && (firstSend || GPS.distanceBetween(prefs.getDouble("lat", 0.0), prefs.getDouble("lng", 0.0), lat, lng) > MINIMUM_DISTANCE))
     {
+      firstSend = false;
       uint32_t LatitudeBinary = ((lat + 90) / 180.0) * 16777215;
       uint32_t LongitudeBinary = ((lng + 180) / 360.0) * 16777215;
       uint16_t altitudeGps = GPS.altitude.meters();
       uint8_t hdopGps = GPS.hdop.value() / 10;
-      uint8_t batteryLevel = getBatLevel();
+      //uint8_t batteryLevel = getBatLevel();
       if (TTN_MAPPER)
       {
         tdata[0] = (LatitudeBinary >> 16) & 0xFF;
@@ -191,14 +193,37 @@ void do_send(osjob_t *j)
       }
       else
       {
+        //TODO: 
+        // 62 byte buffer containing 10 coordinates à 6 bytes and 2 bytes for meta (battery?) -> airtime: 
+        // 133,4@SF7 -> 14s pause, 224 messages/d -> 2240 coords/d -> 6,2h tracking @ 10s interval, message every 100s
+        // 246,3@SF8 -> 25s pause, 121 messages/d -> 1210 coords/d -> 3,3h tracking
+        // 431,1@SF9 -> 42s pause, 69 messages/d -> 690 coords/d -> 1,9h tracking
+        // OR
+        // 115 byte buffer containing 19 coordinates à 6 bytes and 1 byte for meta (battery?) -> airtime:
+        // 215.3@SF7 -> 22s pause, 139 messages/d -> 2641 coords/d ->  7,3h tracking @ 10s interval, message every 190s
+        // 379.4@SF8 -> 38s pause, 79 messages/d -> 1501 coords/d -> 4,1h tracking
+        // 676.9@SF9 -> 68s pause, 
+        // OR
+        // 121 byte buffer containing 20 coordinates à 6 bytes and 1 byte for meta (battery?) -> airtime:
+        // 220,4@SF7 -> 22s pause, 136 messages/d -> 2720 coords/d -> 7,5h tracking @ 10s interval, message every 200s
+        // 389.6@SF8 ->
+        // 
+        // OR
+        // 185 byte buffer containing 30 coordinates à 6 bytes and 5 bytes for meta (battery?) -> airtime:
+        // 317,7@SF7 -> 32s pause, 94 messages/d -> 2820 coords/d -> 7,8h tracking @ 10s interval, message every 300s
+        // 553,5@SF8 -> 56s pause, 54 messages/d -> 1620 coords/d -> 4,5h tracking
+        // OR
+        // 222 byte buffer containing 37 coordinates à 6 bytes -> airtime:
+        // 368,9@SF7 -> 37s pause, 81 messages/d -> 2997 coords/d -> 8,3h tracking @ 10s interval, message every 370s
+        // 655,9@SF8 -> 66s pause, 45 messages/d -> 1665 coords/d -> 4,6h tracking
         bdata[0] = (LatitudeBinary >> 16) & 0xFF;
         bdata[1] = (LatitudeBinary >> 8) & 0xFF;
         bdata[2] = LatitudeBinary & 0xFF;
         bdata[3] = (LongitudeBinary >> 16) & 0xFF;
         bdata[4] = (LongitudeBinary >> 8) & 0xFF;
         bdata[5] = LongitudeBinary & 0xFF;
-        bdata[6] = batteryLevel & 0xFF;
-        LMIC_setTxData2(1, bdata, sizeof(bdata), 0);
+        u1_t port = 1;
+        LMIC_setTxData2(port, bdata, sizeof(bdata), 0);
       }
       digitalWrite(BOARD_LED, LED_ON);
       LoraStatus = "QUEUED";
@@ -218,6 +243,10 @@ void setup()
   WiFi.setSleep(true);
   prefs.begin("lat", false);
   prefs.begin("lng", false);
+  prefs.begin("frameCountUp", false);
+  prefs.begin("frameCountDown", false);
+  prefs.begin("maxvlt", false);
+  prefs.begin("minvlt", false);
 
   GPSSerial.begin(SERIAL_SPEED, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   while (!GPSSerial)
@@ -243,6 +272,7 @@ void setup()
   os_init();
   LMIC_reset();
   LMIC_setSession(0x1, DEVADDR, NWKSKEY, APPSKEY);
+  LMIC_setSeqnoUp(prefs.getUInt("frameCountUp"));
 
   // Setup EU Channels
   LMIC_setupChannel(0, 868100000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);  // g-band

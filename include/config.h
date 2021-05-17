@@ -24,6 +24,10 @@ static const u4_t DEVADDR = SECRET_DEVADDR;       // LoRaWAN Device Address (HEX
 #define RADIO_RST_PIN 23
 #define RADIO_DIO1_PIN 33
 #define RADIO_BUSY_PIN 32
+#define DISABLE_PING
+#define DISABLE_BEACONS
+#define LMIC_DEBUG_LEVEL 1
+#define DISABLE_JOIN
 
 #define BOARD_LED 4
 #define LED_ON LOW
