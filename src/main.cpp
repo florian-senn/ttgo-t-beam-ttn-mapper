@@ -20,6 +20,9 @@ BLEServer *pServer;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
+TinyGPSLocation locBuf[MSG_SIZE];
+uint8_t msg_pointer = 0;
+
 class MyServerCallbacks : public BLEServerCallbacks
 {
   void onConnect(BLEServer *pServer)
@@ -48,7 +51,7 @@ AXP20X_Class axp;
 
 String LoraStatus;
 uint8_t tdata[9];
-uint8_t bdata[6];
+uint8_t bdata[6 * MSG_SIZE];
 
 static osjob_t sendjob;
 
@@ -78,6 +81,8 @@ bool gpsHasFix()
 unsigned long now = millis();
 unsigned long bleSpan = 5000UL;
 unsigned long lastBle = now + bleSpan;
+unsigned long gpsSpan = 3000UL;
+unsigned long lastGps = now + gpsSpan;
 uint8_t lastBatLevel = 0;
 
 // Lora Event Handling
@@ -170,7 +175,7 @@ void do_send(osjob_t *j)
   {
     double lat = GPS.location.lat();
     double lng = GPS.location.lng();
-    if (gpsHasFix() && (firstSend || GPS.distanceBetween(prefs.getDouble("lat", 0.0), prefs.getDouble("lng", 0.0), lat, lng) > MINIMUM_DISTANCE))
+    if ((!TTN_MAPPER || gpsHasFix()) && (firstSend || GPS.distanceBetween(prefs.getDouble("lat", 0.0), prefs.getDouble("lng", 0.0), lat, lng) > MINIMUM_DISTANCE))
     {
       firstSend = false;
       uint32_t LatitudeBinary = ((lat + 90) / 180.0) * 16777215;
@@ -193,8 +198,8 @@ void do_send(osjob_t *j)
       }
       else
       {
-        //TODO: 
-        // 62 byte buffer containing 10 coordinates à 6 bytes and 2 bytes for meta (battery?) -> airtime: 
+        //TODO:
+        // 62 byte buffer containing 10 coordinates à 6 bytes and 2 bytes for meta (battery?) -> airtime:
         // 133,4@SF7 -> 14s pause, 224 messages/d -> 2240 coords/d -> 6,2h tracking @ 10s interval, message every 100s
         // 246,3@SF8 -> 25s pause, 121 messages/d -> 1210 coords/d -> 3,3h tracking
         // 431,1@SF9 -> 42s pause, 69 messages/d -> 690 coords/d -> 1,9h tracking
@@ -202,12 +207,12 @@ void do_send(osjob_t *j)
         // 115 byte buffer containing 19 coordinates à 6 bytes and 1 byte for meta (battery?) -> airtime:
         // 215.3@SF7 -> 22s pause, 139 messages/d -> 2641 coords/d ->  7,3h tracking @ 10s interval, message every 190s
         // 379.4@SF8 -> 38s pause, 79 messages/d -> 1501 coords/d -> 4,1h tracking
-        // 676.9@SF9 -> 68s pause, 
+        // 676.9@SF9 -> 68s pause,
         // OR
         // 121 byte buffer containing 20 coordinates à 6 bytes and 1 byte for meta (battery?) -> airtime:
         // 220,4@SF7 -> 22s pause, 136 messages/d -> 2720 coords/d -> 7,5h tracking @ 10s interval, message every 200s
         // 389.6@SF8 ->
-        // 
+        //
         // OR
         // 185 byte buffer containing 30 coordinates à 6 bytes and 5 bytes for meta (battery?) -> airtime:
         // 317,7@SF7 -> 32s pause, 94 messages/d -> 2820 coords/d -> 7,8h tracking @ 10s interval, message every 300s
@@ -216,14 +221,27 @@ void do_send(osjob_t *j)
         // 222 byte buffer containing 37 coordinates à 6 bytes -> airtime:
         // 368,9@SF7 -> 37s pause, 81 messages/d -> 2997 coords/d -> 8,3h tracking @ 10s interval, message every 370s
         // 655,9@SF8 -> 66s pause, 45 messages/d -> 1665 coords/d -> 4,6h tracking
-        bdata[0] = (LatitudeBinary >> 16) & 0xFF;
-        bdata[1] = (LatitudeBinary >> 8) & 0xFF;
-        bdata[2] = LatitudeBinary & 0xFF;
-        bdata[3] = (LongitudeBinary >> 16) & 0xFF;
-        bdata[4] = (LongitudeBinary >> 8) & 0xFF;
-        bdata[5] = LongitudeBinary & 0xFF;
-        u1_t port = 1;
-        LMIC_setTxData2(port, bdata, sizeof(bdata), 0);
+        if (msg_pointer == (uint8_t)MSG_SIZE)
+        {
+          for (uint8_t i = 0; i < MSG_SIZE; i++)
+          {
+            uint32_t LatitudeBinary = ((locBuf[i].lat() + 90) / 180.0) * 16777215;
+            uint32_t LongitudeBinary = ((locBuf[i].lng() + 180) / 360.0) * 16777215;
+            bdata[0 + (i * 6)] = (LatitudeBinary >> 16) & 0xFF;
+            bdata[1 + (i * 6)] = (LatitudeBinary >> 8) & 0xFF;
+            bdata[2 + (i * 6)] = LatitudeBinary & 0xFF;
+            bdata[3 + (i * 6)] = (LongitudeBinary >> 16) & 0xFF;
+            bdata[4 + (i * 6)] = (LongitudeBinary >> 8) & 0xFF;
+            bdata[5 + (i * 6)] = LongitudeBinary & 0xFF;
+          }
+          u1_t port = 1;
+          LMIC_setTxData2(port, bdata, sizeof(bdata), 0);
+          msg_pointer = 0;
+        }
+        else
+        {
+          os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
+        }
       }
       digitalWrite(BOARD_LED, LED_ON);
       LoraStatus = "QUEUED";
@@ -232,7 +250,7 @@ void do_send(osjob_t *j)
     }
     else
     {
-      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(3), do_send);
+      os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
     }
   }
 }
@@ -248,7 +266,7 @@ void setup()
   prefs.begin("maxvlt", false);
   prefs.begin("minvlt", false);
 
-  GPSSerial.begin(SERIAL_SPEED, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  GPSSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   while (!GPSSerial)
     ;
 
@@ -376,6 +394,19 @@ void BLE()
   }
 }
 
+void recordGps()
+{
+  if (now - lastGps > gpsSpan)
+  {
+    Serial.print("msg " + String(msg_pointer));
+    Serial.print(" lat: " + String(GPS.location.lat(), 5));
+    Serial.println(" lng: " + String(GPS.location.lng(), 5));
+    locBuf[msg_pointer % (MSG_SIZE - 1)] = GPS.location;
+    msg_pointer++;
+    lastGps = now;
+  }
+}
+
 void loop()
 {
   os_runloop_once();
@@ -390,5 +421,6 @@ void loop()
   {
     GPSSerial.write(Serial.read());
   }
+  recordGps();
   BLE();
 }
