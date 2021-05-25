@@ -20,9 +20,6 @@ BLEServer *pServer;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-TinyGPSLocation locBuf[MSG_SIZE];
-uint8_t msg_pointer = 0;
-
 class MyServerCallbacks : public BLEServerCallbacks
 {
   void onConnect(BLEServer *pServer)
@@ -51,7 +48,7 @@ AXP20X_Class axp;
 
 String LoraStatus;
 uint8_t tdata[9];
-uint8_t bdata[6 * MSG_SIZE];
+uint8_t bdata[6];
 
 static osjob_t sendjob;
 
@@ -221,27 +218,14 @@ void do_send(osjob_t *j)
         // 222 byte buffer containing 37 coordinates à 6 bytes -> airtime:
         // 368,9@SF7 -> 37s pause, 81 messages/d -> 2997 coords/d -> 8,3h tracking @ 10s interval, message every 370s
         // 655,9@SF8 -> 66s pause, 45 messages/d -> 1665 coords/d -> 4,6h tracking
-        if (msg_pointer == (uint8_t)MSG_SIZE)
-        {
-          for (uint8_t i = 0; i < MSG_SIZE; i++)
-          {
-            uint32_t LatitudeBinary = ((locBuf[i].lat() + 90) / 180.0) * 16777215;
-            uint32_t LongitudeBinary = ((locBuf[i].lng() + 180) / 360.0) * 16777215;
-            bdata[0 + (i * 6)] = (LatitudeBinary >> 16) & 0xFF;
-            bdata[1 + (i * 6)] = (LatitudeBinary >> 8) & 0xFF;
-            bdata[2 + (i * 6)] = LatitudeBinary & 0xFF;
-            bdata[3 + (i * 6)] = (LongitudeBinary >> 16) & 0xFF;
-            bdata[4 + (i * 6)] = (LongitudeBinary >> 8) & 0xFF;
-            bdata[5 + (i * 6)] = LongitudeBinary & 0xFF;
-          }
-          u1_t port = 1;
-          LMIC_setTxData2(port, bdata, sizeof(bdata), 0);
-          msg_pointer = 0;
-        }
-        else
-        {
-          os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(1), do_send);
-        }
+        bdata[0] = (LatitudeBinary >> 16) & 0xFF;
+        bdata[1] = (LatitudeBinary >> 8) & 0xFF;
+        bdata[2] = LatitudeBinary & 0xFF;
+        bdata[3] = (LongitudeBinary >> 16) & 0xFF;
+        bdata[4] = (LongitudeBinary >> 8) & 0xFF;
+        bdata[5] = LongitudeBinary & 0xFF;
+        u1_t port = 1;
+        LMIC_setTxData2(port, bdata, sizeof(bdata), 0);
       }
       digitalWrite(BOARD_LED, LED_ON);
       LoraStatus = "QUEUED";
@@ -394,19 +378,6 @@ void BLE()
   }
 }
 
-void recordGps()
-{
-  if (now - lastGps > gpsSpan)
-  {
-    Serial.print("msg " + String(msg_pointer));
-    Serial.print(" lat: " + String(GPS.location.lat(), 5));
-    Serial.println(" lng: " + String(GPS.location.lng(), 5));
-    locBuf[msg_pointer % (MSG_SIZE - 1)] = GPS.location;
-    msg_pointer++;
-    lastGps = now;
-  }
-}
-
 void loop()
 {
   os_runloop_once();
@@ -421,6 +392,5 @@ void loop()
   {
     GPSSerial.write(Serial.read());
   }
-  recordGps();
   BLE();
 }
